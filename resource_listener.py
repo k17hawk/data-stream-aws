@@ -1,11 +1,11 @@
 import os
 import sys
-from pyspark.sql import SparkSession
-import boto3
 import json
 import time
-from pyspark.sql.functions import *
 from datetime import datetime
+import boto3
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit
 
 # Environment Validation
 def validate_environment():
@@ -28,9 +28,9 @@ def validate_environment():
     print(f"Local output will be saved to: {os.path.abspath(required_vars['LOCAL_OUTPUT_DIR'])}")
     return required_vars
 
-# Initialize Spark
+# Initialize Spark only when needed with cleanup disabled
 def create_spark_session(config):
-    print("Initializing Spark session...")
+    print("\nInitializing Spark session for processing...")
 
     # Set Hadoop home and required Windows paths
     os.environ['HADOOP_HOME'] = 'C:\\hadoop-3.3.6'
@@ -58,81 +58,18 @@ def create_spark_session(config):
         .config("spark.hadoop.fs.s3a.aws.credentials.provider", 
                 "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider") \
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
+        .config("spark.cleaner.referenceTracking.cleanCheckpoints", "false") \
+        .config("spark.cleaner.referenceTracking.blocking", "false") \
+        .config("spark.cleaner.referenceTracking.blocking.shuffle", "false") \
+        .config("spark.executor.extraJavaOptions", "-Djava.io.tmpdir=C:/spark-temp") \
+        .config("spark.driver.extraJavaOptions", "-Djava.io.tmpdir=C:/spark-temp") \
         .getOrCreate()
 
-    # Set Hadoop file permissions (works only after Spark session is created)
-    try:
-        os.system("C:\\hadoop-3.3.6\\bin\\winutils.exe chmod 777 C:\\spark-warehouse")
-        os.system("C:\\hadoop-3.3.6\\bin\\winutils.exe chmod 777 C:\\spark-temp")
-        os.system("C:\\hadoop-3.3.6\\bin\\winutils.exe chmod 777 C:\\tmp\\hive")
-    except Exception as e:
-        print(f"Warning: Could not set permissions via winutils: {str(e)}")
-    
-    # Verify versions
-    print("\n=== Environment Verification ===")
-    print(f"Spark Version: {spark.version}")
-    print(f"Hadoop Version: {spark._jvm.org.apache.hadoop.util.VersionInfo.getVersion()}")
-    
-    try:
-        s3a_class = spark._jvm.org.apache.hadoop.fs.s3a.S3AFileSystem
-        print("S3AFileSystem loaded successfully")
-    except Exception as e:
-        print(f"Could not access S3AFileSystem: {str(e)}")
-    
-    print("===============================\n")
     spark.sparkContext.setLogLevel("WARN")
     return spark
 
-
-def process_file(spark, bucket, key, local_output_dir):
-    """Process and save file with detailed logging"""
-    try:
-        print(f"\nProcessing file: s3://{bucket}/{key}")
-        
-        # Extract file info
-        filename = key.split('/')[-1]
-        file_format = filename.split('.')[-1].lower()
-        base_name = filename.split('.')[0]
-        timestamp = int(time.time())
-        
-        # Supported formats
-        if file_format not in ['csv', 'parquet', 'json']:
-            print(f"Unsupported file format: {file_format}")
-            return False
-
-        # Read file
-        s3_path = f"s3a://{bucket}/{key}"
-        print(f"Reading from S3: {s3_path}")
-        df = spark.read.format(file_format).load(s3_path)
-        
-        # Show file info
-        print(f"Schema:")
-        df.printSchema()
-        print(f"Row count: {df.count()}")
-        
-        # Add processing metadata
-        processed_df = df.withColumn("_processing_timestamp", lit(datetime.now())) \
-                       .withColumn("_source_file", lit(filename))
-        
-        # Save locally (Parquet format)
-        local_path = f"{local_output_dir}/{base_name}_{timestamp}"
-        print(f"Saving locally to: {local_path}")
-        processed_df.write.mode("overwrite").parquet(local_path)
-        
-        # Verify local save
-        if os.path.exists(local_path):
-            print(f"Successfully saved {len(os.listdir(local_path))} files to {local_path}")
-            return True
-        else:
-            print("ERROR: Local output directory not created!")
-            return False
-            
-    except Exception as e:
-        print(f"ERROR processing file: {str(e)}")
-        return False
 def process_file(spark, bucket, key, local_output_dir):
     """Process and save CSV file from S3 with detailed logging"""
-
     try:
         print(f"\nProcessing file: s3://{bucket}/{key}")
         
@@ -150,11 +87,7 @@ def process_file(spark, bucket, key, local_output_dir):
         # Read CSV from S3
         s3_path = f"s3a://{bucket}/{key}"
         print(f"Reading from S3: {s3_path}")
-        print("\nUsing Hadoop Version:")
-        print(spark._jvm.org.apache.hadoop.util.VersionInfo.getVersion())
-        print("Using Spark Version:")
-        print(spark.version)
-
+        
         df = spark.read.option("header", "true").option("inferSchema", "true").csv(s3_path)
 
         # Show schema and count
@@ -183,59 +116,74 @@ def process_file(spark, bucket, key, local_output_dir):
         print(f"ERROR processing file: {str(e)}")
         return False
 
+def graceful_spark_shutdown(spark):
+    """Handle Spark shutdown gracefully ignoring cleanup errors"""
+    try:
+        print("Attempting to stop Spark session...")
+        spark.stop()
+    except Exception as e:
+        print(f"Ignored error during Spark shutdown: {str(e)}")
+    finally:
+        print("Spark resources released")
 
-def process_messages(spark, sqs_client, queue_url, local_output_dir):
-    print(f"\nStarting SQS polling from: {queue_url}")
+def process_messages(config, sqs_client):
+    print(f"\nStarting lightweight SQS polling from: {config['SQS_QUEUE_URL']}")
     
     while True:
         try:
             response = sqs_client.receive_message(
-                QueueUrl=queue_url,
+                QueueUrl=config['SQS_QUEUE_URL'],
                 MaxNumberOfMessages=1,
                 WaitTimeSeconds=20,
                 VisibilityTimeout=300
             )
             
             if 'Messages' in response:
-                for message in response['Messages']:
-                    try:
-                        print("\n" + "="*50)
-                        print(f"Processing message ID: {message['MessageId']}")
-                        
-                        body = json.loads(message['Body'])
-                        print(f"Message body: {json.dumps(body, indent=2)}")
-                        
-                        # Handle both direct bucket/key format and S3 event format
-                        if 'bucket' in body and 'key' in body:
-                            # Direct format (what you're seeing)
-                            bucket = body['bucket']
-                            key = body['key']
-                            if process_file(spark, bucket, key, local_output_dir):
-                                print("File processing successful")
-                            else:
-                                print("File processing failed")
-                        elif 'Records' in body:
-                            # Standard S3 event format
-                            for record in body['Records']:
-                                bucket = record['s3']['bucket']['name']
-                                key = record['s3']['object']['key']
-                                if process_file(spark, bucket, key, local_output_dir):
+                spark = None
+                try:
+                    spark = create_spark_session(config)
+                    
+                    for message in response['Messages']:
+                        try:
+                            print("\n" + "="*50)
+                            print(f"Processing message ID: {message['MessageId']}")
+                            
+                            body = json.loads(message['Body'])
+                            print(f"Message body: {json.dumps(body, indent=2)}")
+                            
+                            if 'bucket' in body and 'key' in body:
+                                bucket = body['bucket']
+                                key = body['key']
+                                if process_file(spark, bucket, key, config['LOCAL_OUTPUT_DIR']):
                                     print("File processing successful")
                                 else:
                                     print("File processing failed")
-                        else:
-                            print("Unrecognized message format")
-                            continue
-                        
-                        # Only delete if processing succeeded
-                        sqs_client.delete_message(
-                            QueueUrl=queue_url,
-                            ReceiptHandle=message['ReceiptHandle']
-                        )
-                        print("Message deleted from queue")
-                        
-                    except Exception as e:
-                        print(f"ERROR processing message: {str(e)}")
+                            elif 'Records' in body:
+                                for record in body['Records']:
+                                    bucket = record['s3']['bucket']['name']
+                                    key = record['s3']['object']['key']
+                                    if process_file(spark, bucket, key, config['LOCAL_OUTPUT_DIR']):
+                                        print("File processing successful")
+                                    else:
+                                        print("File processing failed")
+                            else:
+                                print("Unrecognized message format")
+                                continue
+                            
+                            sqs_client.delete_message(
+                                QueueUrl=config['SQS_QUEUE_URL'],
+                                ReceiptHandle=message['ReceiptHandle']
+                            )
+                            print("Message deleted from queue")
+                            
+                        except Exception as e:
+                            print(f"ERROR processing message: {str(e)}")
+                            time.sleep(5)
+                
+                finally:
+                    if spark:
+                        graceful_spark_shutdown(spark)
+            
             else:
                 print("No messages available, waiting...")
                 time.sleep(5)
@@ -246,7 +194,6 @@ def process_messages(spark, sqs_client, queue_url, local_output_dir):
 
 def main():
     config = validate_environment()
-    spark = create_spark_session(config)
     
     sqs_client = boto3.client(
         'sqs',
@@ -256,13 +203,10 @@ def main():
     )
     
     try:
-        process_messages(spark, sqs_client, config['SQS_QUEUE_URL'], config['LOCAL_OUTPUT_DIR'])
+        process_messages(config, sqs_client)
     except KeyboardInterrupt:
         print("\nShutting down gracefully...")
-    finally:
-        spark.stop()
-        print("Spark session stopped")
 
 if __name__ == "__main__":
-    print("Starting S3 Stream Processor")
+    print("Starting Optimized S3 Stream Processor")
     main()
