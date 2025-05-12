@@ -3,3 +3,5 @@ uvicorn
 boto3
 python-dotenv
 pyspark
+pydantic
+pydantic-settings
