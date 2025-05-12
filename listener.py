@@ -7,7 +7,6 @@ import time
 from pyspark.sql.functions import *
 from datetime import datetime
 
-# Environment Validation
 def validate_environment():
     required_vars = {
         'AWS_ACCESS_KEY_ID': os.getenv('AWS_ACCESS_KEY_ID'),
@@ -28,15 +27,12 @@ def validate_environment():
     print(f"Local output will be saved to: {os.path.abspath(required_vars['LOCAL_OUTPUT_DIR'])}")
     return required_vars
 
-# Initialize Spark
 def create_spark_session(config):
     print("Initializing Spark session...")
 
-    # Set Hadoop home and required Windows paths
     os.environ['HADOOP_HOME'] = 'C:\\hadoop-3.3.6'
     os.environ['PATH'] = f"{os.environ['PATH']};C:\\hadoop-3.3.6\\bin"
 
-    # Create directories if they don't exist
     os.makedirs("C:/spark-warehouse", exist_ok=True)
     os.makedirs("C:/spark-temp", exist_ok=True)
     os.makedirs("C:/tmp/hive", exist_ok=True)
@@ -59,8 +55,6 @@ def create_spark_session(config):
                 "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider") \
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
         .getOrCreate()
-
-    # Set Hadoop file permissions (works only after Spark session is created)
     try:
         os.system("C:\\hadoop-3.3.6\\bin\\winutils.exe chmod 777 C:\\spark-warehouse")
         os.system("C:\\hadoop-3.3.6\\bin\\winutils.exe chmod 777 C:\\spark-temp")
@@ -68,7 +62,6 @@ def create_spark_session(config):
     except Exception as e:
         print(f"Warning: Could not set permissions via winutils: {str(e)}")
     
-    # Verify versions
     print("\n=== Environment Verification ===")
     print(f"Spark Version: {spark.version}")
     print(f"Hadoop Version: {spark._jvm.org.apache.hadoop.util.VersionInfo.getVersion()}")
@@ -100,21 +93,18 @@ def process_file(spark, bucket, key, local_output_dir):
             print(f"Unsupported file format: {file_format}")
             return False
 
-        # Read file
+
         s3_path = f"s3a://{bucket}/{key}"
         print(f"Reading from S3: {s3_path}")
         df = spark.read.format(file_format).load(s3_path)
         
-        # Show file info
         print(f"Schema:")
         df.printSchema()
         print(f"Row count: {df.count()}")
         
-        # Add processing metadata
         processed_df = df.withColumn("_processing_timestamp", lit(datetime.now())) \
                        .withColumn("_source_file", lit(filename))
         
-        # Save locally (Parquet format)
         local_path = f"{local_output_dir}/{base_name}_{timestamp}"
         print(f"Saving locally to: {local_path}")
         processed_df.write.mode("overwrite").parquet(local_path)
@@ -136,18 +126,15 @@ def process_file(spark, bucket, key, local_output_dir):
     try:
         print(f"\nProcessing file: s3://{bucket}/{key}")
         
-        # Extract file info
+  
         filename = key.split('/')[-1]
         file_format = filename.split('.')[-1].lower()
         base_name = os.path.splitext(filename)[0]
         timestamp = int(time.time())
-        
-        # Check for supported formats
+    
         if file_format != 'csv':
             print(f"Unsupported file format: {file_format}")
             return False
-
-        # Read CSV from S3
         s3_path = f"s3a://{bucket}/{key}"
         print(f"Reading from S3: {s3_path}")
         print("\nUsing Hadoop Version:")
@@ -156,8 +143,6 @@ def process_file(spark, bucket, key, local_output_dir):
         print(spark.version)
 
         df = spark.read.option("header", "true").option("inferSchema", "true").csv(s3_path)
-
-        # Show schema and count
         print("Schema:")
         df.printSchema()
         print(f"Row count: {df.count()}")
@@ -204,10 +189,9 @@ def process_messages(spark, sqs_client, queue_url, local_output_dir):
                         
                         body = json.loads(message['Body'])
                         print(f"Message body: {json.dumps(body, indent=2)}")
-                        
-                        # Handle both direct bucket/key format and S3 event format
+                
                         if 'bucket' in body and 'key' in body:
-                            # Direct format (what you're seeing)
+                        
                             bucket = body['bucket']
                             key = body['key']
                             if process_file(spark, bucket, key, local_output_dir):
@@ -215,7 +199,7 @@ def process_messages(spark, sqs_client, queue_url, local_output_dir):
                             else:
                                 print("File processing failed")
                         elif 'Records' in body:
-                            # Standard S3 event format
+                
                             for record in body['Records']:
                                 bucket = record['s3']['bucket']['name']
                                 key = record['s3']['object']['key']
@@ -226,8 +210,7 @@ def process_messages(spark, sqs_client, queue_url, local_output_dir):
                         else:
                             print("Unrecognized message format")
                             continue
-                        
-                        # Only delete if processing succeeded
+                   
                         sqs_client.delete_message(
                             QueueUrl=queue_url,
                             ReceiptHandle=message['ReceiptHandle']
