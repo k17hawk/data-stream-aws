@@ -1,18 +1,33 @@
-from fastapi import FastAPI, Request
-import asyncio
+import time
+from config import get_config
+from utils.environment import validate_environment
+from component.spark_manager import SparkManager
+from component.file_processor import FileProcessor
+from component.sqs_consumer import SQSConsumer
 
-app = FastAPI()
+def main():
+    config = get_config()
+    validate_environment(config)
+    
+    sqs_consumer = SQSConsumer(config)
+    
+    try:
+        while True:
+            event = sqs_consumer.poll_messages()
+            if event:
+                spark = None
+                try:
+                    spark = SparkManager.create_session(config)
+                    if FileProcessor.process(spark, event, config):
+                        sqs_consumer.acknowledge_message(event.receipt_handle)
+                finally:
+                    if spark:
+                        SparkManager.shutdown_session(spark)
+            else:
+                time.sleep(5)
+                
+    except KeyboardInterrupt:
+        print("\nShutdown requested")
 
-@app.post("/trigger-spark")
-async def trigger_spark(request: Request):
-    data = await request.json()
-    bucket = data.get("bucket")
-    key = data.get("key")
-
-    # Log or trigger your Spark job here
-    print(f"Received trigger for S3 file: s3://{bucket}/{key}")
-
-    # You could also call a Spark-submit, enqueue a job, etc.
-    # subprocess.run(["spark-submit", "your_script.py", bucket, key])
-
-    return {"message": "Spark job trigger received", "file": f"s3://{bucket}/{key}"}
+if __name__ == "__main__":
+    main()
