@@ -8,3 +8,4 @@ if __name__ == "__main__":
         process_messages()
     except KeyboardInterrupt:
         logger.info("Application shutdown requested. Exiting...")
+
